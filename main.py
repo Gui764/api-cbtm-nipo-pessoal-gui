@@ -80,6 +80,12 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
  )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://gui764-tenisdemesa-pontuacao.great-site.net"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------- VALIDAÇÃO
