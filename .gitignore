@@ -219,6 +219,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Banco local da API
+*.db
+*.sqlite
+*.sqlite3
+torneios_cbtm.db
+
 *.db
 *.sqlite
 *.sqlite3
