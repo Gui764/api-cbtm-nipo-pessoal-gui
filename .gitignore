@@ -224,7 +224,3 @@ __marimo__/
 *.sqlite
 *.sqlite3
 torneios_cbtm.db
-
-*.db
-*.sqlite
-*.sqlite3
