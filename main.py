@@ -62,7 +62,7 @@ async def lifespan(_: FastAPI):
     pw = await async_playwright().start()
     _state["pw"] = pw
     _state["browser"] = await pw.chromium.launch(
-        headless=True,  # Invisível para máxima velocidade
+        headless=True,  # Voltou a invisível para máxima velocidade
         args=["--no-sandbox", "--disable-dev-shm-usage"]
     )
     yield
@@ -74,12 +74,14 @@ app = FastAPI(title="CBTM API - Simulador Nipo", version="1.0", lifespan=lifespa
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://gui764-tenisdemesa-pontuacao.great-site.net"
+        "https://gui764-tenisdemesa-pontuacao.great-site.net",
+        "http://gui764-tenisdemesa-pontuacao.great-site.net",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-)
+ )
+
 
 # ---------------------------------------------------------------- VALIDAÇÃO
 def validar_url(url: str) -> str:
