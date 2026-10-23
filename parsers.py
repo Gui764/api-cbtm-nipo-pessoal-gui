@@ -8,7 +8,7 @@ import re
 SEP = re.compile(r"[\n\t]+")
 RE_INT = re.compile(r"^\d+$")
 RE_DATA = re.compile(r"\d{2}/\d{2}/\d{4}")
-RE_JOGO = re.compile(r"Jogo\s*(\d+)\s*-\s*Mesa\s*([\w\-]+)\s*-\s*(\d{1,2}:\d{2})", re.I)
+RE_JOGO = re.compile(r"Jogo\s*(\d+)(?:\s*-\s*Mesa\s*([\w\-]+))?(?:\s*-\s*(\d{1,2}:\d{2}))?", re.I)
 RE_PLACAR = re.compile(r"^(\d+)\s*-\s*(\d+)$")
 RE_GRUPO = re.compile(r"^(.*?)\s*-\s*Grupo\s*(\d+)$", re.I)
 RE_STATUS = re.compile(r"^(?:(?P<cat>.*?)\s+)?(?P<st>Pré-?\s?inscrito|Inscrito)$", re.I)

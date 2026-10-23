@@ -216,9 +216,21 @@ async def abrir_aba(page: Page, padrao: str):
     if await loc.count():
         try:
             await loc.first.click(timeout=3000, force=True)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Não consegui clicar na aba '{padrao}': {e}")
+    else:
+        logger.warning(f"Aba '{padrao}' não encontrada na página.")
     await aguardar(page)
+
+
+async def esperar_texto(page: Page, padrao: str, timeout: int = 12_000) -> bool:
+    """Espera até o texto (regex) aparecer na página. Eventos encerrados, com muitos jogos, carregam devagar."""
+    try:
+        await page.wait_for_function(
+            "(p) => new RegExp(p, 'i').test(document.body.innerText)", arg=padrao, timeout=timeout)
+        return True
+    except PWTimeout:
+        return False
 
 async def coletar(page: Page, needle: str, rolar: bool = False) -> list[str]:
     if not rolar:
@@ -275,15 +287,26 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             item["inscricoes"] = parse_inscricoes(await coletar(page, r"pts\.\s*Ranking"))
         if "grupos" in incluir:
             await abrir_aba(page, r"^\s*grupos")
-            await page.wait_for_timeout(2000)
+            await esperar_texto(page, r"Grupo\s*\d+", 8_000)
+            await page.wait_for_timeout(1500)
             item["grupos"] = parse_grupos(await page.inner_text("body"))
         if "resultados" in incluir:
             await abrir_aba(page, r"resultados")
-            await page.wait_for_timeout(2000)
-            jogos = [j for j in (parse_jogo(t) for t in await coletar(page, r"Jogo\s*\d+", rolar=True)) if j]
+            await esperar_texto(page, r"Jogo\s*\d+", 12_000)
+            await page.wait_for_timeout(1500)
+            cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
+            if not cards:  # 2ª tentativa: a aba pode não ter aberto ou carregou devagar (eventos encerrados)
+                await abrir_aba(page, r"resultados")
+                await esperar_texto(page, r"Jogo\s*\d+", 15_000)
+                await page.wait_for_timeout(2000)
+                cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
+            jogos = [j for j in (parse_jogo(t) for t in cards) if j]
             jogos.sort(key=lambda j: j["jogo"])
             item["resultados"] = jogos
             item["fase_eliminatoria"] = montar_eliminatoria(jogos)
+            if debug:
+                item["_debug_resultados"] = {"cards_encontrados": len(cards), "jogos_lidos": len(jogos),
+                                             "exemplo_cards": cards[:3], "url_final": page.url}
         resultado.append(item)
 
     out = {"tipo": "evento", "evento": evento, "categorias": resultado}
@@ -291,7 +314,7 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
         out["_debug"] = {
             "url_final": page.url,
             "categorias_detectadas": [c["rotulo"] for c in cats],
-            "texto_pagina": (await page.inner_text("body"))[:4000],
+            "texto_pagina": (await page.inner_text("body"))[:12000],
             "chamadas_json": chamadas[:50],
         }
     return out
@@ -341,11 +364,23 @@ class MenuCategorias(str, Enum):
     MASTER_40_MAS = "MASTER 40MAS"
     MASTER_50_MAS = "MASTER 50MAS"
 
+def calcular_ttl(dados: dict) -> int:
+    """Evento encerrado (com campeão) = 24 h. Com grupos/jogos = 2 min (acompanhamento ao vivo).
+    Sem grupos nem jogos = 1 min (assim um resultado vazio nunca fica preso na memória)."""
+    cats = dados.get("categorias") or []
+    if any(((c.get("fase_eliminatoria") or {}).get("podio") or {}).get("1o") for c in cats):
+        return 86400
+    if any(c.get("grupos") or c.get("resultados") for c in cats):
+        return 120
+    return 60
+
+
 class Pedido(BaseModel):
     url: str = Field(..., examples=["https://app.cbtm.org.br/IUI/App/Evento?tab=0&EVE_Evento_ID=6135"])
     categoria: str | None = Field(None)
     incluir: list[str] = Field(default_factory=lambda: sorted(SECOES))
     debug: bool = False
+    renovar: bool = False  # ignora o cache e lê de novo o site da CBTM
 
 async def processar(p: Pedido) -> dict:
     url = validar_url(p.url)
@@ -356,14 +391,17 @@ async def processar(p: Pedido) -> dict:
     chave = f"{url}|{sorted(incluir)}|{(p.categoria or '').lower()}"
     
     # 1. Verifica na Base de Dados (SQLite)
-    if not p.debug:
+    if not p.debug and not p.renovar:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
             cur.execute("SELECT timestamp, dados FROM cache_eventos WHERE chave=?", (chave,))
             row = cur.fetchone()
-            if row and (time.time() - row[0] < CACHE_TTL):
-                logger.info("Torneio carregado instantaneamente da base de dados!")
-                return {**json.loads(row[1]), "banco_dados": True}
+            if row:
+                guardado = json.loads(row[1])
+                ttl = guardado.pop("_ttl", 60)  # registros antigos (sem validade) expiram em 1 min
+                if time.time() - row[0] < ttl:
+                    logger.info("Torneio carregado instantaneamente da base de dados!")
+                    return {**guardado, "banco_dados": True}
 
     # 2. Se não estiver no banco (ou se o debug estiver ativo), extrai direto do site
     async with _sem:
@@ -378,7 +416,7 @@ async def processar(p: Pedido) -> dict:
             conn.execute("""
                 INSERT OR REPLACE INTO cache_eventos (chave, timestamp, dados)
                 VALUES (?, ?, ?)
-            """, (chave, time.time(), json.dumps(dados)))
+            """, (chave, time.time(), json.dumps({**dados, "_ttl": calcular_ttl(dados)})))
             logger.info("Novo torneio guardado na base de dados com sucesso.")
 
     return {**dados, "banco_dados": False}
@@ -393,11 +431,12 @@ async def extrair_get(
     categoria: MenuCategorias | None = Query(None, description="Selecione ou deixe vazio para trazer tudo"),
     incluir: str = Query(",".join(sorted(SECOES))),
     debug: bool = False,
+    renovar: bool = False,
 ):
     cat_str = categoria.value if categoria else None
     return await processar(Pedido(url=url, categoria=cat_str,
                                   incluir=[s.strip() for s in incluir.split(",") if s.strip()],
-                                  debug=debug))
+                                  debug=debug, renovar=renovar))
 
 @app.post("/api/extrair")
 async def extrair_post(p: Pedido):
