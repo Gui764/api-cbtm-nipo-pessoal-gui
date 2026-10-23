@@ -289,7 +289,15 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             await abrir_aba(page, r"^\s*grupos")
             await esperar_texto(page, r"Grupo\s*\d+", 8_000)
             await page.wait_for_timeout(1500)
-            item["grupos"] = parse_grupos(await page.inner_text("body"))
+            corpo_grupos = await page.inner_text("body")
+            item["grupos"] = parse_grupos(corpo_grupos)
+            if not item["grupos"]:
+                # distingue "a CBTM diz que não há grupos" de "a leitura não encontrou nada"
+                item["aviso_grupos"] = ("indisponivel_na_cbtm"
+                                        if re.search(r"grupos\s+não\s+estão\s+disponíveis", corpo_grupos, re.I)
+                                        else "nao_encontrado")
+            if debug:
+                item["_debug_grupos"] = {"texto": corpo_grupos[:3500]}
         if "resultados" in incluir:
             await abrir_aba(page, r"resultados")
             await esperar_texto(page, r"Jogo\s*\d+", 12_000)
@@ -307,6 +315,13 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             if debug:
                 item["_debug_resultados"] = {"cards_encontrados": len(cards), "jogos_lidos": len(jogos),
                                              "exemplo_cards": cards[:3], "url_final": page.url}
+            if not jogos:
+                corpo_res = await page.inner_text("body")
+                item["aviso_resultados"] = ("indisponivel_na_cbtm"
+                                            if re.search(r"resultados\s+não\s+estão\s+disponíveis", corpo_res, re.I)
+                                            else "nao_encontrado")
+                if debug:
+                    item["_debug_resultados"]["texto"] = corpo_res[:3500]
         resultado.append(item)
 
     out = {"tipo": "evento", "evento": evento, "categorias": resultado}
