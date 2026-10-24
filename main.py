@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from parsers import (
     parse_categoria, parse_inscricoes, parse_grupos, parse_jogo,
@@ -47,7 +48,7 @@ init_db()
 # ---------------------------------------------------------------- CONSTANTES
 ALLOWED_HOSTS = {"app.cbtm.org.br", "cbtm.org.br", "www.cbtm.org.br"}
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # Cache no banco dura 1 hora (3600 segundos)
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))  # plano gratuito: pouca memória, 1 navegador por vez
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 SECOES = {"inscricoes", "grupos", "resultados"}
 
@@ -72,6 +73,17 @@ async def lifespan(_: FastAPI):
     await pw.stop()
 
 app = FastAPI(title="CBTM API - Simulador Nipo", version="1.0", lifespan=lifespan)
+@app.middleware("http")
+async def capturar_erros(request, call_next):
+    """Qualquer erro interno vira uma resposta JSON normal. Fica DENTRO do CORS, então o site recebe a mensagem
+    real em vez de "Failed to fetch" (erros 500 comuns saem sem os cabeçalhos de CORS)."""
+    try:
+        return await call_next(request)
+    except Exception as e:
+        logger.exception("Erro interno não tratado")
+        return JSONResponse({"detail": f"Erro interno da API: {type(e).__name__}: {e}"}, status_code=500)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
