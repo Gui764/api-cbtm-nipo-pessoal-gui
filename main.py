@@ -63,7 +63,8 @@ async def lifespan(_: FastAPI):
     _state["pw"] = pw
     _state["browser"] = await pw.chromium.launch(
         headless=True,  # Voltou a invisível para máxima velocidade
-        args=["--no-sandbox", "--disable-dev-shm-usage"]
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions",
+              "--disable-background-networking", "--mute-audio", "--no-first-run"]
     )
     yield
     logger.info("A encerrar o motor Playwright...")
@@ -91,6 +92,9 @@ def validar_url(url: str) -> str:
     return p._replace(scheme="https").geturl()
 
 # ---------------------------------------------------------------- NAVEGADOR
+TRACKERS = ("google-analytics", "googletagmanager", "doubleclick", "facebook", "hotjar", "clarity.ms")
+
+
 async def nova_pagina():
     ctx = await _state["browser"].new_context(
         locale="pt-BR", 
@@ -103,6 +107,8 @@ async def nova_pagina():
 
     async def filtro(route):
         req = route.request
+        if any(t in (urlparse(req.url).hostname or "").lower() for t in TRACKERS):
+            return await route.abort()
         if req.resource_type in {"image", "media", "font", "stylesheet"}:
             return await route.abort()
         if req.resource_type == "document" and not (urlparse(req.url).hostname or "").lower().endswith("cbtm.org.br"):
@@ -114,9 +120,10 @@ async def nova_pagina():
             if "json" in r.headers.get("content-type", "") else None)
     return ctx, page, chamadas
 
-async def aguardar(page: Page, ms: int = 600):
+async def aguardar(page: Page, ms: int = 150):
+    """Pausa curta. A espera de verdade é feita por esperar_dados/esperar_texto (terminam assim que o conteúdo aparece)."""
     try:
-        await page.wait_for_load_state("networkidle", timeout=8_000)
+        await page.wait_for_load_state("networkidle", timeout=1_500)
     except PWTimeout:
         pass
     await page.wait_for_timeout(ms)
@@ -150,6 +157,17 @@ JS_PASSO = """(reset) => {
   return resta;
 }"""
 
+async def esperar_opcoes(page: Page, timeout: int = 1_500) -> int:
+    """Espera a lista de categorias abrir (mais de 1 opção visível). Volta assim que abrir."""
+    fim = time.monotonic() + timeout / 1000
+    n = 0
+    while True:
+        n = await page.get_by_text(OPCAO).count()
+        if n > 1 or time.monotonic() >= fim:
+            return n
+        await page.wait_for_timeout(100)
+
+
 async def abrir_dropdown(page: Page) -> bool:
     for sel in [".dxeButtonEditSys", "mat-select", "[role=combobox]", ".v-select", "[class*=select]", "select"]:
         loc = page.locator(sel).first
@@ -157,8 +175,7 @@ async def abrir_dropdown(page: Page) -> bool:
             try:
                 await loc.wait_for(state="visible", timeout=3000)
                 await loc.click(force=True)
-                await page.wait_for_timeout(1000)
-                if await page.get_by_text(OPCAO).count() > 1:
+                if await esperar_opcoes(page) > 1:
                     return True
                 await page.keyboard.press("Escape")
             except:
@@ -168,18 +185,12 @@ async def abrir_dropdown(page: Page) -> bool:
     if await atual.count():
         try:
             await atual.click(force=True)
-            await page.wait_for_timeout(1000)
-            return await page.get_by_text(OPCAO).count() > 1
+            return await esperar_opcoes(page) > 1
         except:
             pass
     return False
 
 async def listar_categorias(page: Page) -> list[dict]:
-    try:
-        await page.wait_for_selector(".mat-option-text, .v-list-item__title", timeout=5000, state="attached")
-    except:
-        pass
-    
     aberto = await abrir_dropdown(page)
     loc = page.get_by_text(OPCAO)
     rotulos: list[str] = []
@@ -266,39 +277,59 @@ async def esperar_sem_loading(page: Page, timeout: int = 10_000) -> bool:
     """Espera sumir o aviso "Loading…" do site (os dados de Grupos/Resultados chegam depois da aba abrir)."""
     try:
         await page.wait_for_function(
-            "() => !/\\b(Loading|Carregando)\\b/i.test(document.body.innerText)", timeout=timeout)
+            "() => !/\\b(Loading|Carregando)\\b/i.test(document.body ? document.body.innerText : '')", timeout=timeout)
         return True
     except PWTimeout:
         return False
 
 
 async def ir_para_aba(page: Page, url: str, padrao: str, idx: int, sucesso: str,
-                      rotulo: str, unica: bool, timeout: int = 12_000) -> bool:
-    """Abre a aba e ESPERA OS DADOS CARREGAREM (texto de sucesso, ex.: "Grupo 1" ou "Jogo 3").
-    A frase "não estão disponíveis" NÃO conta como sucesso: ela aparece antes de os dados chegarem.
+                      rotulo: str, unica: bool, base_ms: int = 6_000, max_ms: int = 40_000) -> bool:
+    """Abre a aba e espera os dados (texto de sucesso, ex.: "Grupo 1" / "Jogo 3"). A frase "não estão disponíveis"
+    NÃO conta como sucesso (aparece antes de os dados chegarem). Se ficar "Loading…", espera até max_ms (abas lentas).
     Se não carregar clicando, abre pelo link (?tab=N), escolhe a categoria de novo e espera de novo."""
     await abrir_aba(page, padrao)
-    await esperar_sem_loading(page, 8_000)
-    if await esperar_texto(page, sucesso, timeout):
+    if await esperar_dados(page, sucesso, base_ms, max_ms):
         return True
     logger.warning(f"Aba '{padrao}' sem dados após clicar; tentando pelo link com tab={idx}.")
     try:
         await page.goto(url_com_aba(url, idx), wait_until="domcontentloaded", timeout=45_000)
-        await aguardar(page, 1_500)
+        await esperar_texto(page, OPCAO.pattern, 15_000)
         await selecionar_categoria(page, rotulo, unica)
-        await aguardar(page, 1_500)
     except Exception as e:
         logger.warning(f"Falha ao abrir a aba '{padrao}' pelo link: {e}")
         return False
-    await esperar_sem_loading(page, 10_000)
-    return await esperar_texto(page, sucesso, timeout)
+    return await esperar_dados(page, sucesso, base_ms, max_ms)
+
+
+JS_ESTADO = """(p) => {
+  const t = document.body ? document.body.innerText : '';
+  return {ok: new RegExp(p, 'i').test(t), loading: /\\b(Loading|Carregando)\\b/i.test(t)};
+}"""
+
+
+async def esperar_dados(page: Page, sucesso: str, base_ms: int = 6_000, max_ms: int = 40_000) -> bool:
+    """Espera os dados aparecerem (texto "sucesso"). Se o site mostra "Loading…", continua esperando (até max_ms),
+    porque algumas abas demoram. Se NÃO há "Loading…" e nada chegou em base_ms, desiste (aba vazia/indisponível)."""
+    ini = time.monotonic()
+    while True:
+        try:
+            est = await page.evaluate(JS_ESTADO, sucesso)
+        except Exception:  # página navegando: tenta de novo
+            est = {"ok": False, "loading": True}
+        if est["ok"]:
+            return True
+        decorrido = (time.monotonic() - ini) * 1000
+        if decorrido >= (max_ms if est["loading"] else base_ms):
+            return False
+        await page.wait_for_timeout(200)
 
 
 async def esperar_texto(page: Page, padrao: str, timeout: int = 12_000) -> bool:
     """Espera até o texto (regex) aparecer na página. Eventos encerrados, com muitos jogos, carregam devagar."""
     try:
         await page.wait_for_function(
-            "(p) => new RegExp(p, 'i').test(document.body.innerText)", arg=padrao, timeout=timeout)
+            "(p) => new RegExp(p, 'i').test(document.body ? document.body.innerText : '')", arg=padrao, timeout=timeout)
         return True
     except PWTimeout:
         return False
@@ -308,12 +339,17 @@ async def coletar(page: Page, needle: str, rolar: bool = False) -> list[str]:
         return await page.evaluate(JS_CARDS, needle)
     vistos: dict[str, str] = {}
     await page.evaluate(JS_PASSO, True)
+    sem_novidade = 0
     for _ in range(80):
+        antes = len(vistos)
         for c in await page.evaluate(JS_CARDS, needle):
             vistos.setdefault(c, c)
         if not await page.evaluate(JS_PASSO, False):
             break
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(250)
+        sem_novidade = sem_novidade + 1 if len(vistos) == antes else 0
+        if sem_novidade >= 5:  # rolou 5 vezes seguidas sem aparecer nada novo: acabou a lista
+            break
     for c in await page.evaluate(JS_CARDS, needle):
         vistos.setdefault(c, c)
     return list(vistos)
@@ -350,21 +386,21 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
     for c in cats:
         await selecionar_categoria(page, c["rotulo"], unica)
         item = {k: c[k] for k in ("categoria", "inscritos", "pre_inscritos")}
-        await page.wait_for_timeout(2000) 
+        await esperar_sem_loading(page, 3_000)
 
         if "inscricoes" in incluir:
             await abrir_aba(page, r"inscri")
-            await page.wait_for_timeout(2000)
+            await esperar_dados(page, r"pts\.\s*Ranking", 8_000, 30_000)
             item["inscricoes"] = parse_inscricoes(await coletar(page, r"pts\.\s*Ranking"))
         if "grupos" in incluir:
             await ir_para_aba(page, url, r"^\s*grupos", 1, r"Grupo\s*\d+",
-                              c["rotulo"], unica, 12_000)
-            await page.wait_for_timeout(1500)
+                              c["rotulo"], unica, 6_000, 40_000)
+            await page.wait_for_timeout(300)
             corpo_grupos = await page.inner_text("body")
             item["grupos"] = parse_grupos(corpo_grupos)
             if not item["grupos"]:  # última chance: espera mais um pouco e lê de novo antes de concluir
-                await esperar_sem_loading(page, 5_000)
-                await page.wait_for_timeout(2_500)
+                await esperar_sem_loading(page, 4_000)
+                await page.wait_for_timeout(1_200)
                 corpo_grupos = await page.inner_text("body")
                 item["grupos"] = parse_grupos(corpo_grupos)
             if not item["grupos"]:
@@ -376,13 +412,13 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
                 item["_debug_grupos"] = {"texto": corpo_grupos[:3500]}
         if "resultados" in incluir:
             await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
-                              c["rotulo"], unica, 15_000)
-            await page.wait_for_timeout(1500)
+                              c["rotulo"], unica, 8_000, 60_000)
+            await page.wait_for_timeout(300)
             cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
             if not cards:  # 2ª tentativa: a aba pode não ter aberto ou carregou devagar (eventos encerrados)
                 await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
-                                  c["rotulo"], unica, 20_000)
-                await page.wait_for_timeout(2000)
+                                  c["rotulo"], unica, 10_000, 60_000)
+                await page.wait_for_timeout(600)
                 cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
             jogos = [j for j in (parse_jogo(t) for t in cards) if j]
             jogos.sort(key=lambda j: j["jogo"])
@@ -431,7 +467,11 @@ async def extrair(url: str, incluir: set[str], filtro: str | None, debug: bool) 
         except PWTimeout:
             logger.warning("Timeout parcial. A tentar ler os elementos que carregaram...")
             
-        await page.wait_for_timeout(8000) 
+        if "/iui/app/evento" in urlparse(url).path.lower():
+            await esperar_texto(page, OPCAO.pattern, 15_000)  # termina assim que a página carrega
+            await page.wait_for_timeout(300)
+        else:
+            await page.wait_for_timeout(2_000)
         
         if "login" in page.url.lower() and "login" not in url.lower():
             raise HTTPException(403, "A página exige login e não pode ser lida.")
