@@ -13,7 +13,7 @@ import sqlite3
 import logging
 from enum import Enum
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -202,25 +202,96 @@ async def selecionar_categoria(page: Page, rotulo: str, unica: bool):
     if unica:
         return
     await abrir_dropdown(page)
+    loc = page.get_by_text(rotulo, exact=True)
+    clicou = False
     try:
-        await page.get_by_text(rotulo, exact=True).last.click(timeout=3000, force=True)
-    except:
-        pass
+        n = await loc.count()
+    except Exception:
+        n = 0
+    for i in range(n - 1, -1, -1):  # do último (lista aberta) para o primeiro, só elementos visíveis
+        el = loc.nth(i)
+        try:
+            if not await el.is_visible():
+                continue
+            await el.click(timeout=3000)
+            clicou = True
+            break
+        except Exception as e:
+            logger.warning(f"Falha ao clicar na categoria '{rotulo}': {e}")
+    if not clicou:
+        try:
+            await loc.last.click(timeout=3000, force=True)  # último recurso
+        except Exception as e:
+            logger.warning(f"Não consegui selecionar a categoria '{rotulo}': {e}")
     await aguardar(page)
 
-async def abrir_aba(page: Page, padrao: str):
+
+async def abrir_aba(page: Page, padrao: str) -> bool:
+    """Clica na aba (Inscrições/Grupos/Resultados). Tenta vários tipos de elemento e só clica nos visíveis."""
     rx = re.compile(padrao, re.I)
-    loc = page.get_by_role("tab", name=rx)
-    if not await loc.count():
-        loc = page.get_by_text(rx)
-    if await loc.count():
+    candidatos = [
+        page.get_by_role("tab", name=rx),
+        page.locator("[class*='dxtc-tab']").filter(has_text=rx),
+        page.get_by_text(rx),
+    ]
+    for loc in candidatos:
         try:
-            await loc.first.click(timeout=3000, force=True)
-        except Exception as e:
-            logger.warning(f"Não consegui clicar na aba '{padrao}': {e}")
-    else:
-        logger.warning(f"Aba '{padrao}' não encontrada na página.")
+            n = await loc.count()
+        except Exception:
+            continue
+        for i in range(min(n, 8)):
+            el = loc.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                await el.click(timeout=3000)
+                await aguardar(page)
+                return True
+            except Exception as e:
+                logger.warning(f"Falha ao clicar na aba '{padrao}': {e}")
+    logger.warning(f"Nenhum elemento clicável encontrado para a aba '{padrao}'.")
     await aguardar(page)
+    return False
+
+
+def url_com_aba(url: str, n: int) -> str:
+    """Mesmo link do evento, mas abrindo direto a aba n (0=Inscrições, 1=Grupos, 2=Resultados, 3=Eliminatória)."""
+    p = urlparse(url)
+    q = {k: v[0] for k, v in parse_qs(p.query, keep_blank_values=True).items() if k.lower() != "tab"}
+    q["tab"] = str(n)
+    return urlunparse(p._replace(query=urlencode(q)))
+
+
+async def esperar_sem_loading(page: Page, timeout: int = 10_000) -> bool:
+    """Espera sumir o aviso "Loading…" do site (os dados de Grupos/Resultados chegam depois da aba abrir)."""
+    try:
+        await page.wait_for_function(
+            "() => !/\\b(Loading|Carregando)\\b/i.test(document.body.innerText)", timeout=timeout)
+        return True
+    except PWTimeout:
+        return False
+
+
+async def ir_para_aba(page: Page, url: str, padrao: str, idx: int, sucesso: str,
+                      rotulo: str, unica: bool, timeout: int = 12_000) -> bool:
+    """Abre a aba e ESPERA OS DADOS CARREGAREM (texto de sucesso, ex.: "Grupo 1" ou "Jogo 3").
+    A frase "não estão disponíveis" NÃO conta como sucesso: ela aparece antes de os dados chegarem.
+    Se não carregar clicando, abre pelo link (?tab=N), escolhe a categoria de novo e espera de novo."""
+    await abrir_aba(page, padrao)
+    await esperar_sem_loading(page, 8_000)
+    if await esperar_texto(page, sucesso, timeout):
+        return True
+    logger.warning(f"Aba '{padrao}' sem dados após clicar; tentando pelo link com tab={idx}.")
+    try:
+        await page.goto(url_com_aba(url, idx), wait_until="domcontentloaded", timeout=45_000)
+        await aguardar(page, 1_500)
+        await selecionar_categoria(page, rotulo, unica)
+        await aguardar(page, 1_500)
+    except Exception as e:
+        logger.warning(f"Falha ao abrir a aba '{padrao}' pelo link: {e}")
+        return False
+    await esperar_sem_loading(page, 10_000)
+    return await esperar_texto(page, sucesso, timeout)
 
 
 async def esperar_texto(page: Page, padrao: str, timeout: int = 12_000) -> bool:
@@ -286,11 +357,16 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             await page.wait_for_timeout(2000)
             item["inscricoes"] = parse_inscricoes(await coletar(page, r"pts\.\s*Ranking"))
         if "grupos" in incluir:
-            await abrir_aba(page, r"^\s*grupos")
-            await esperar_texto(page, r"Grupo\s*\d+", 8_000)
+            await ir_para_aba(page, url, r"^\s*grupos", 1, r"Grupo\s*\d+",
+                              c["rotulo"], unica, 12_000)
             await page.wait_for_timeout(1500)
             corpo_grupos = await page.inner_text("body")
             item["grupos"] = parse_grupos(corpo_grupos)
+            if not item["grupos"]:  # última chance: espera mais um pouco e lê de novo antes de concluir
+                await esperar_sem_loading(page, 5_000)
+                await page.wait_for_timeout(2_500)
+                corpo_grupos = await page.inner_text("body")
+                item["grupos"] = parse_grupos(corpo_grupos)
             if not item["grupos"]:
                 # distingue "a CBTM diz que não há grupos" de "a leitura não encontrou nada"
                 item["aviso_grupos"] = ("indisponivel_na_cbtm"
@@ -299,13 +375,13 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             if debug:
                 item["_debug_grupos"] = {"texto": corpo_grupos[:3500]}
         if "resultados" in incluir:
-            await abrir_aba(page, r"resultados")
-            await esperar_texto(page, r"Jogo\s*\d+", 12_000)
+            await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
+                              c["rotulo"], unica, 15_000)
             await page.wait_for_timeout(1500)
             cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
             if not cards:  # 2ª tentativa: a aba pode não ter aberto ou carregou devagar (eventos encerrados)
-                await abrir_aba(page, r"resultados")
-                await esperar_texto(page, r"Jogo\s*\d+", 15_000)
+                await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
+                                  c["rotulo"], unica, 20_000)
                 await page.wait_for_timeout(2000)
                 cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
             jogos = [j for j in (parse_jogo(t) for t in cards) if j]
