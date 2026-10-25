@@ -148,7 +148,9 @@ JS_CARDS = """(needle) => {
   for (const el of document.querySelectorAll('body *')) {
     if (n(el) !== 1) continue;
     const p = el.parentElement;
-    if (p && n(p) === 1) continue;
+    // Sobe até o maior contêiner com 1 ocorrência (o card), mas para antes de pegar a página inteira
+    // (quando só existe UM card, os contêineres de cima também têm 1 ocorrência).
+    if (p && p !== document.body && n(p) === 1 && (p.innerText || '').length <= 700) continue;
     out.push(el.innerText);
   }
   return out;
@@ -169,18 +171,34 @@ JS_PASSO = """(reset) => {
   return resta;
 }"""
 
+async def contar_visiveis(loc) -> int:
+    try:
+        n = await loc.count()
+    except Exception:
+        return 0
+    v = 0
+    for i in range(n):
+        try:
+            if await loc.nth(i).is_visible():
+                v += 1
+        except Exception:
+            pass
+    return v
+
+
 async def esperar_opcoes(page: Page, timeout: int = 1_500) -> int:
-    """Espera a lista de categorias abrir (mais de 1 opção visível). Volta assim que abrir."""
+    """Espera a lista de categorias abrir (mais de 1 opção VISÍVEL). Volta assim que abrir."""
     fim = time.monotonic() + timeout / 1000
-    n = 0
     while True:
-        n = await page.get_by_text(OPCAO).count()
+        n = await contar_visiveis(page.get_by_text(OPCAO))
         if n > 1 or time.monotonic() >= fim:
             return n
         await page.wait_for_timeout(100)
 
 
 async def abrir_dropdown(page: Page) -> bool:
+    if await contar_visiveis(page.get_by_text(OPCAO)) > 1:  # já está aberta
+        return True
     for sel in [".dxeButtonEditSys", "mat-select", "[role=combobox]", ".v-select", "[class*=select]", "select"]:
         loc = page.locator(sel).first
         if await loc.count():
@@ -296,13 +314,25 @@ async def esperar_sem_loading(page: Page, timeout: int = 10_000) -> bool:
 
 
 async def ir_para_aba(page: Page, url: str, padrao: str, idx: int, sucesso: str,
-                      rotulo: str, unica: bool, base_ms: int = 6_000, max_ms: int = 40_000) -> bool:
-    """Abre a aba e espera os dados (texto de sucesso, ex.: "Grupo 1" / "Jogo 3"). A frase "não estão disponíveis"
-    NÃO conta como sucesso (aparece antes de os dados chegarem). Se ficar "Loading…", espera até max_ms (abas lentas).
-    Se não carregar clicando, abre pelo link (?tab=N), escolhe a categoria de novo e espera de novo."""
+                      rotulo: str, unica: bool, base_ms: int = 6_000, max_ms: int = 40_000,
+                      indisp: str | None = None) -> str:
+    """Abre a aba e espera os dados (texto de sucesso, ex.: "Grupo 1" / "Jogo 3"). Devolve:
+    "ok" (dados chegaram), "indisponivel" (a aba abriu e a CBTM diz que não há dados) ou "falhou".
+    Se ficar "Loading…", espera até max_ms (abas lentas). Se a aba nem abriu clicando, tenta pelo link (?tab=N)."""
+    async def indisponivel() -> bool:
+        if not indisp:
+            return False
+        try:
+            return bool(await page.evaluate(
+                "(p) => new RegExp(p, 'i').test(document.body ? document.body.innerText : '')", indisp))
+        except Exception:
+            return False
+
     await abrir_aba(page, padrao)
     if await esperar_dados(page, sucesso, base_ms, max_ms):
-        return True
+        return "ok"
+    if await indisponivel():  # a aba abriu, mas a CBTM diz que não há dados: não adianta insistir
+        return "indisponivel"
     logger.warning(f"Aba '{padrao}' sem dados após clicar; tentando pelo link com tab={idx}.")
     try:
         await page.goto(url_com_aba(url, idx), wait_until="domcontentloaded", timeout=45_000)
@@ -310,8 +340,10 @@ async def ir_para_aba(page: Page, url: str, padrao: str, idx: int, sucesso: str,
         await selecionar_categoria(page, rotulo, unica)
     except Exception as e:
         logger.warning(f"Falha ao abrir a aba '{padrao}' pelo link: {e}")
-        return False
-    return await esperar_dados(page, sucesso, base_ms, max_ms)
+        return "falhou"
+    if await esperar_dados(page, sucesso, base_ms, max_ms):
+        return "ok"
+    return "indisponivel" if await indisponivel() else "falhou"
 
 
 JS_ESTADO = """(p) => {
@@ -405,12 +437,12 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             await esperar_dados(page, r"pts\.\s*Ranking", 8_000, 30_000)
             item["inscricoes"] = parse_inscricoes(await coletar(page, r"pts\.\s*Ranking"))
         if "grupos" in incluir:
-            await ir_para_aba(page, url, r"^\s*grupos", 1, r"Grupo\s*\d+",
-                              c["rotulo"], unica, 6_000, 40_000)
+            st_g = await ir_para_aba(page, url, r"^\s*grupos", 1, r"Grupo\s*\d+",
+                                     c["rotulo"], unica, 6_000, 40_000, r"grupos\s+não\s+estão\s+disponíveis")
             await page.wait_for_timeout(300)
             corpo_grupos = await page.inner_text("body")
             item["grupos"] = parse_grupos(corpo_grupos)
-            if not item["grupos"]:  # última chance: espera mais um pouco e lê de novo antes de concluir
+            if not item["grupos"] and st_g != "indisponivel":  # última chance: espera mais um pouco e lê de novo antes de concluir
                 await esperar_sem_loading(page, 4_000)
                 await page.wait_for_timeout(1_200)
                 corpo_grupos = await page.inner_text("body")
@@ -423,13 +455,13 @@ async def extrair_evento(page: Page, url: str, incluir: set[str], filtro: str | 
             if debug:
                 item["_debug_grupos"] = {"texto": corpo_grupos[:3500]}
         if "resultados" in incluir:
-            await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
-                              c["rotulo"], unica, 8_000, 60_000)
+            st_r = await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
+                                     c["rotulo"], unica, 8_000, 60_000, r"resultados\s+não\s+estão\s+disponíveis")
             await page.wait_for_timeout(300)
             cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
-            if not cards:  # 2ª tentativa: a aba pode não ter aberto ou carregou devagar (eventos encerrados)
+            if not cards and st_r == "falhou":  # 2ª tentativa só se a leitura falhou (não se a CBTM disse "indisponível")
                 await ir_para_aba(page, url, r"resultados", 2, r"Jogo\s*\d+",
-                                  c["rotulo"], unica, 10_000, 60_000)
+                                  c["rotulo"], unica, 10_000, 60_000, r"resultados\s+não\s+estão\s+disponíveis")
                 await page.wait_for_timeout(600)
                 cards = await coletar(page, r"Jogo\s*\d+", rolar=True)
             jogos = [j for j in (parse_jogo(t) for t in cards) if j]
